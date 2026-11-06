@@ -12,15 +12,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use flowsurface_exchange::adapter::AdapterHandles;
-use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::api::{Server, query_concurrency_limit};
-use crate::config::{Args, BearerToken, Config};
+use crate::config::{Args, BearerToken, Config, WhitelistTemplates};
 use crate::limiter::{ADMISSION_GLOBAL_CAP, ADMISSION_PER_IP_BUDGET, AdmissionGate, RateLimiter};
 use crate::storage::Storage;
 
@@ -65,8 +65,9 @@ async fn main() {
 struct App {
     storage: Storage,
     adapter_handles: AdapterHandles,
-    resolved_pairs: Vec<TickerInfo>,
-    metadata_cache: discovery::MetadataCache,
+    discovery: discovery::SharedDiscovery,
+    base_assets: Vec<String>,
+    whitelist: WhitelistTemplates,
     bind_address: SocketAddr,
     auth_token: Option<BearerToken>,
     flush_interval: std::time::Duration,
@@ -121,8 +122,19 @@ impl App {
         )
         .await;
 
+        let discovery = Arc::new(parking_lot::RwLock::new(discovery::DiscoveryState::new(
+            &config.pairs.base_assets,
+            &whitelist,
+            &metadata_cache,
+            resolved_pairs.clone(),
+        )));
+
         if resolved_pairs.is_empty() {
-            if config.pairs.discovery_mode {
+            if !discovery.read().pending_exchanges.is_empty() {
+                tracing::warn!(
+                    "No configured pairs resolved yet; continuing with automatic exchange discovery recovery"
+                );
+            } else if config.pairs.discovery_mode {
                 tracing::warn!(
                     "No matching pairs for base_assets {:?} with current whitelist \
                      - discovery mode is on, so /exchanges is still populated.",
@@ -175,8 +187,9 @@ impl App {
         Self {
             storage,
             adapter_handles,
-            resolved_pairs,
-            metadata_cache,
+            discovery,
+            base_assets: config.pairs.base_assets.clone(),
+            whitelist,
             bind_address: config.network.bind_address,
             auth_token: config.auth_token.clone(),
             flush_interval: std::time::Duration::from_millis(config.storage.flush_interval_ms),
@@ -191,11 +204,16 @@ impl App {
     /// Start the pipeline (stream engine, flusher, cleanup) and the HTTP server.
     async fn serve(self) -> AppHandles {
         let shutdown = CancellationToken::new();
+        let resolved_pairs = self.discovery.read().resolved_pairs.clone();
 
         let (stream_mgr, mut rx) = stream::StreamManager::start_streams(
             self.adapter_handles,
-            &self.resolved_pairs,
+            &resolved_pairs,
             shutdown.child_token(),
+            self.storage.clone(),
+            self.discovery.clone(),
+            &self.base_assets,
+            &self.whitelist,
         );
 
         let cleanup_last_run = tokio::task::spawn_blocking({
@@ -215,10 +233,6 @@ impl App {
             self.max_buffered_trades,
         );
 
-        let configured_pairs: Vec<Ticker> =
-            self.resolved_pairs.iter().map(|ti| ti.ticker).collect();
-
-        let available_tickers = discovery::tickers_per_exchange(&self.metadata_cache);
         let admission_gate = AdmissionGate::new(ADMISSION_PER_IP_BUDGET, ADMISSION_GLOBAL_CAP);
         if self.auth_token.is_some() {
             tracing::info!(
@@ -229,8 +243,7 @@ impl App {
         let server = Arc::new(Server::new(
             self.storage,
             self.auth_token,
-            configured_pairs,
-            &available_tickers,
+            self.discovery,
             self.tls_config,
             self.rate_limiter,
             admission_gate,
@@ -260,52 +273,52 @@ struct AppHandles {
 }
 
 impl AppHandles {
-    const SHUTDOWN_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
-
-    /// Wait for SIGINT/SIGTERM, then cancel all streams, drain in-flight
-    /// trades, and join every background task within the grace period.
+    /// Wait for SIGINT/SIGTERM, then stop producers, drain every accepted
+    /// event, and durably flush all trades before allowing process exit.
     async fn shutdown(mut self) {
-        let mut sigint =
-            signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-        tokio::select! {
-            _ = sigint.recv() => {}
-            _ = sigterm.recv() => {}
-        }
+        wait_for_shutdown_signal().await;
 
         tracing::info!("Shutting down…");
 
         // 1. Cancel all stream tasks (they share the root token).
         self.shutdown.cancel();
 
-        // 2. Drop persist sender so downstream consumers drain.
-        if let Some(ref mut mgr) = self.stream_mgr {
-            mgr.drop_persist_sender();
+        // 2. Streaming tasks stop sending, then the router drains its input
+        // channel and finally drops the persist sender.
+        if let Some(mgr) = self.stream_mgr.take() {
+            mgr.shutdown().await;
         }
 
-        // 3. Join everything within the grace period.
-        tokio::time::timeout(Self::SHUTDOWN_GRACE_PERIOD, async {
-            // Flusher first - it drains the trade buffer to disk.
-            let _ = self.flusher.await;
+        // 3. The flusher sees channel closure only after the router drain and
+        // retries until every accepted batch is durable.
+        let _ = self.flusher.await;
 
-            // Streaming tasks (engine + handler).
-            if let Some(mgr) = self.stream_mgr.take() {
-                mgr.shutdown().await;
-            }
+        // 4. Background cleanup may be mid-purge/CHECKPOINT; do not abandon it while it
+        // owns the database.
+        let _ = self._cleanup.await;
 
-            // Background cleanup (may be mid-VACUUM - let it finish).
-            let _ = self._cleanup.await;
-
-            // Axum server - signal graceful shutdown first so it stops
-            // accepting new connections and drains in-flight requests.
-            self.server_shutdown_handle
-                .graceful_shutdown(Some(std::time::Duration::from_secs(3)));
-            let _ = self._server.await;
-        })
-        .await
-        .ok();
+        // 5. Stop accepting HTTP work and drain in-flight responses.
+        self.server_shutdown_handle
+            .graceful_shutdown(Some(std::time::Duration::from_secs(3)));
+        let _ = self._server.await;
 
         tracing::info!("Shutdown complete.");
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    tokio::select! {
+        _ = sigint.recv() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to register Ctrl-C handler");
 }

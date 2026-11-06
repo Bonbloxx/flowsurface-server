@@ -1,0 +1,43 @@
+[Unit]
+Description=FlowSurface BTC trade history recorder
+Documentation=https://github.com/Bonbloxx/flowsurface
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h/flowsurface/trade-recorder
+ExecStart=%h/flowsurface/trade-recorder/bin/flowsurface-server --config %h/flowsurface/trade-recorder/config.toml
+Environment=RUST_LOG=flowsurface_server=info,warn
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0077
+
+# Keep this auxiliary recorder isolated from the host's other projects.
+MemoryHigh=768M
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=128
+LimitNOFILE=65536
+Nice=5
+IOWeight=25
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/flowsurface/trade-recorder/data
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

@@ -17,13 +17,13 @@ const MIN_CLEANUP_DELAY: Duration = Duration::from_secs(60);
 /// is configured and the retention window is longer than this.
 const SIZE_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Safety ceiling for the size-based purge loop (200 × 100k = 20M rows).
+/// Safety ceiling for the size-based purge loop (200 x 100k = 20M rows).
 const MAX_PURGE_ITERATIONS: usize = 200;
 
-/// Conservative estimate of on-disk bytes per trade row.  Used only as
-/// a fast-path threshold; the authoritative check is the real file
-/// size after `CHECKPOINT`.
-const EST_BYTES_PER_ROW: u64 = 50;
+/// Re-check real DuckDB usage after at most this many delete batches.  This
+/// bounds WAL growth and makes the size decision evidence-based rather than a
+/// one-shot row-size estimate.
+const MEASURE_EVERY_BATCHES: usize = 20;
 
 /// On small-to-medium caps use a 20 % headroom so the purge leaves
 /// breathing room.  On very large caps the percentage would waste
@@ -45,14 +45,8 @@ fn purge_headroom(cap: StorageBytes) -> StorageBytes {
     }
 }
 
-/// Batch size for each purge iteration — ~10% of the cap, clamped to
-/// [1 000, 100 000].
-fn purge_batch_size(max_bytes: u64) -> i64 {
-    const MIN_ROWS: i64 = 1_000;
-    const MAX_ROWS: i64 = 100_000;
-    let rows = (max_bytes / 10 / EST_BYTES_PER_ROW) as i64;
-    rows.clamp(MIN_ROWS, MAX_ROWS)
-}
+const MIN_PURGE_ROWS: u64 = 100_000;
+const MAX_PURGE_ROWS: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CleanupConfig {
@@ -152,12 +146,14 @@ impl CleanupScheduler {
         let mut time_cleanup_ok = false;
 
         match self.storage.purge_old_trades(self.config.retention_hours) {
-            Ok(n) => {
+            Ok(purge) => {
                 time_cleanup_ok = true;
-                if n > 0 {
+                if purge.deleted > 0 {
                     tracing::info!(
-                        "Cleaned up {n} trade(s) older than {}h",
-                        self.config.retention_hours.as_hours()
+                        "Cleaned up {} trade(s) older than {}h; coverage now starts no earlier than {}",
+                        purge.deleted,
+                        self.config.retention_hours.as_hours(),
+                        purge.retain_from
                     );
                     any_deleted = true;
                 }
@@ -188,86 +184,114 @@ impl CleanupScheduler {
         None
     }
 
-    /// Delete oldest trades until on-disk size is estimated to be under the cap.
-    ///
-    /// To avoid per-iteration CHECKPOINT overhead we use a two-phase approach:
-    /// 1. **Row-count estimate loop** — delete batches until the estimated row
-    ///    count is below the headroom-adjusted threshold.  No CHECKPOINTs here.
-    /// 2. **CHECKPOINT once**, then verify the real file size.  If still over
-    ///    the absolute cap we log a warning — the next periodic pass will retry.
+    /// Delete oldest trades until DuckDB's live blocks are below the target.
     ///
     /// Targets `cap - headroom` so there is breathing room for incoming
-    /// trades between 5-minute checks without wasting space on large caps.
+    /// trades between five-minute checks.  Decisions are verified using both
+    /// the real DB+WAL filesystem allocation and DuckDB's live block count.
+    /// Freed physical blocks are retained by DuckDB for reuse; once live usage
+    /// is below target, deleting more history would not shrink that allocation
+    /// and is therefore forbidden.
     fn purge_oldest_trades_until_below(&self, max_bytes: StorageBytes) -> Result<u64> {
         let headroom = purge_headroom(max_bytes);
+        let minimum = MIN_TARGET.as_bytes().min(max_bytes.as_bytes());
         let target_bytes = max_bytes
             .as_bytes()
             .saturating_sub(headroom.as_bytes())
-            .max(MIN_TARGET.as_bytes());
+            .max(minimum);
         let target_bytes = StorageBytes::from_bytes(target_bytes);
-        let max_est_rows = target_bytes.as_bytes().saturating_div(EST_BYTES_PER_ROW);
-        let batch_size = purge_batch_size(target_bytes.as_bytes());
-        let mut total_deleted = 0u64;
-        let mut converged = false;
 
-        for _ in 0..MAX_PURGE_ITERATIONS {
-            // Cheap row-count check (no CHECKPOINT needed).
-            if self.storage.count_trades()? <= max_est_rows {
-                converged = true;
-                break;
-            }
-            let deleted = self.storage.delete_oldest_trades_batch(batch_size)?;
-            if deleted == 0 {
-                converged = true;
-                break;
-            }
-            total_deleted += deleted;
+        // Cheap fast path: no DuckDB query or checkpoint while the real files
+        // are comfortably inside the headroom-adjusted target.
+        if self.storage.current_storage_bytes()? <= target_bytes {
+            return Ok(0);
         }
 
-        if total_deleted > 0 {
-            self.storage.run_checkpoint()?;
-            let remaining_rows = self.storage.count_trades()?;
+        // CHECKPOINT is the operation DuckDB uses to merge the WAL and reclaim
+        // sufficiently deleted row groups. VACUUM does not reclaim deletes.
+        self.storage.run_checkpoint()?;
+        let mut usage = self.storage.storage_usage()?;
+        let mut total_deleted = 0u64;
+        let mut iterations = 0usize;
 
-            if converged {
-                let current = self.storage.current_storage_bytes()?;
-                if current <= max_bytes {
-                    tracing::info!(
-                        "Cleaned up {total_deleted} trade(s) to keep storage under \
-                         {} MB cap (now ~{} MB)",
-                        max_bytes.as_mb(),
-                        current.as_mb(),
-                    );
-                } else {
-                    tracing::warn!(
-                        "Storage ({} MB) still exceeds {} MB cap after cleanup. \
-                         The next periodic pass will retry.",
-                        current.as_mb(),
-                        max_bytes.as_mb(),
-                    );
-                }
-            } else {
-                tracing::warn!(
-                    "Size-cap purge did not converge after \
-                     {MAX_PURGE_ITERATIONS} iterations (deleted {total_deleted} \
-                     rows); storage may still exceed the {} MB cap",
-                    max_bytes.as_mb(),
+        while usage.active > target_bytes && iterations < MAX_PURGE_ITERATIONS {
+            let remaining_rows = self.storage.count_trades()?;
+            if remaining_rows == 0 {
+                anyhow::bail!(
+                    "DuckDB live storage is {} MB with no trade rows left; refusing to delete metadata",
+                    usage.active.as_mb()
                 );
             }
 
-            if should_vacuum(total_deleted, remaining_rows) {
-                if let Err(e) = self.storage.vacuum() {
-                    tracing::warn!(
-                        "VACUUM after size-cap purge failed (data is \
-                         correct, but filesystem space wasn't reclaimed): \
-                         {e:#}"
-                    );
-                } else {
-                    tracing::debug!(
-                        "VACUUMed database after purging {total_deleted} \
-                         rows ({remaining_rows} remaining)"
-                    );
+            let excess = usage
+                .active
+                .as_bytes()
+                .saturating_sub(target_bytes.as_bytes());
+            let proportional = ((excess as u128)
+                .saturating_mul(remaining_rows as u128)
+                .saturating_add(usage.active.as_bytes() as u128 - 1)
+                / usage.active.as_bytes() as u128) as u64;
+            // Add 10% to avoid repeated tiny passes and always remove at least
+            // one near-row-group batch so CHECKPOINT can reclaim old groups.
+            let planned = proportional
+                .saturating_add(proportional / 10)
+                .max(MIN_PURGE_ROWS)
+                .min(remaining_rows);
+            let mut planned_left = planned;
+            let measurement_deadline =
+                (iterations + MEASURE_EVERY_BATCHES).min(MAX_PURGE_ITERATIONS);
+
+            while planned_left > 0 && iterations < measurement_deadline {
+                let batch = planned_left.min(MAX_PURGE_ROWS) as i64;
+                let deleted = self.storage.delete_oldest_trades_batch(batch)?;
+                if deleted == 0 {
+                    break;
                 }
+                total_deleted = total_deleted.saturating_add(deleted);
+                planned_left = planned_left.saturating_sub(deleted);
+                iterations += 1;
             }
+
+            if total_deleted == 0 {
+                break;
+            }
+            let previous_active = usage.active;
+            self.storage.run_checkpoint()?;
+            usage = self.storage.storage_usage()?;
+            if usage.active >= previous_active && self.storage.count_trades()? == 0 {
+                break;
+            }
+        }
+
+        if usage.active > target_bytes {
+            anyhow::bail!(
+                "storage-cap purge stopped after {iterations} batches and {total_deleted} deleted trades: \
+                 live usage is still {} MB (target {} MB, physical {} MB)",
+                usage.active.as_mb(),
+                target_bytes.as_mb(),
+                usage.physical.as_mb(),
+            );
+        }
+
+        if total_deleted > 0 {
+            tracing::info!(
+                "Cleaned up {total_deleted} oldest trade(s) for the {} MB cap: \
+                 live usage {} MB, physical DB+WAL {} MB, target {} MB",
+                max_bytes.as_mb(),
+                usage.active.as_mb(),
+                usage.physical.as_mb(),
+                target_bytes.as_mb(),
+            );
+        }
+        if usage.physical > max_bytes {
+            tracing::warn!(
+                "DuckDB's allocated DB+WAL is {} MB, above the {} MB cap, but live data is {} MB \
+                 and freed blocks will be reused. Refusing to delete additional truthful history solely \
+                 to chase an allocated file that DuckDB does not shrink in place.",
+                usage.physical.as_mb(),
+                max_bytes.as_mb(),
+                usage.active.as_mb(),
+            );
         }
 
         Ok(total_deleted)
@@ -352,8 +376,108 @@ impl CleanupScheduler {
     }
 }
 
-/// Whether VACUUM is worth running after a purge — only when we've
-/// freed at least ~25% of the remaining data.
-const fn should_vacuum(total_deleted: u64, remaining_rows: u64) -> bool {
-    remaining_rows == 0 || total_deleted >= remaining_rows / 4
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::TradeQuery;
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "flowsurface-server-cleanup-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn size_cap_converges_from_measured_live_blocks_and_clips_coverage() {
+        let dir = test_dir("measured-cap");
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let db_path = dir.join("trades.duckdb");
+        {
+            let conn = duckdb::Connection::open(&db_path).expect("fixture database");
+            conn.execute_batch(
+                "CREATE TABLE trades (
+                    exchange VARCHAR NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    ts BIGINT NOT NULL,
+                    price DOUBLE NOT NULL,
+                    qty DOUBLE NOT NULL,
+                    is_sell BOOLEAN NOT NULL
+                 );
+                 CREATE TABLE capture_intervals (
+                    exchange VARCHAR NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    connected_at BIGINT NOT NULL,
+                    observed_through BIGINT,
+                    closed_at BIGINT,
+                    PRIMARY KEY (exchange, symbol, connected_at)
+                 );
+                 INSERT INTO capture_intervals VALUES
+                    ('binance_linear', 'btcusdt', 0, 499999, 500000);
+                 INSERT INTO trades
+                 SELECT 'binance_linear',
+                        'btcusdt',
+                        i,
+                        CAST(hash(i) AS DOUBLE),
+                        CAST(hash(i * 17) % 100000 AS DOUBLE),
+                        i % 2 = 0
+                 FROM range(500000) AS generated(i);
+                 CHECKPOINT;",
+            )
+            .expect("large fixture");
+        }
+
+        let storage = Storage::open(&dir, 128, 1, 0).expect("test storage");
+        let before = storage.storage_usage().expect("initial usage");
+        let before_rows = storage.count_trades().expect("initial row count");
+        let cap_bytes = before
+            .physical
+            .as_bytes()
+            .min(before.active.as_bytes())
+            .saturating_mul(19)
+            / 20;
+        assert!(cap_bytes > 0);
+        let cap = StorageBytes::from_bytes(cap_bytes);
+        let scheduler = CleanupScheduler {
+            storage: storage.clone(),
+            config: CleanupConfig {
+                retention_hours: RetentionHours::new(0).expect("unlimited"),
+                max_storage_bytes: Some(cap),
+            },
+        };
+
+        let deleted = scheduler
+            .purge_oldest_trades_until_below(cap)
+            .expect("measured size purge");
+        let after = storage.storage_usage().expect("final usage");
+        assert!(deleted > 0);
+        assert!(storage.count_trades().expect("final row count") < before_rows);
+        assert!(after.active <= cap, "{after:?} must fit under {cap:?}");
+
+        let query = TradeQuery {
+            venue: "binance".into(),
+            market: "linear".into(),
+            symbol: "btcusdt".into(),
+            from: Some(0),
+            to: Some(499999),
+            limit: None,
+            stable_order: false,
+        };
+        let coverage = storage
+            .trade_coverage_segments(&query)
+            .expect("coverage after cap purge");
+        assert!(
+            coverage
+                .first()
+                .is_none_or(|segment| segment.from > 0 && segment.to == 499999),
+            "purged history must never remain certified: {coverage:?}"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

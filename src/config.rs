@@ -125,7 +125,7 @@ pub struct StorageConfig {
     /// deleted on startup (and periodically while running).
     #[serde(default = "default_data_retention_hours")]
     pub data_retention_hours: u64,
-    /// Maximum number of trades to buffer in memory before dropping.
+    /// Maximum number of trades to buffer before triggering a durable flush.
     #[serde(default = "default_max_buffered_trades")]
     pub max_buffered_trades: usize,
     /// Hard cap on total DuckDB storage in megabytes.

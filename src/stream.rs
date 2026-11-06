@@ -11,18 +11,23 @@ use flowsurface_exchange::adapter::{
 use flowsurface_exchange::{PushFrequency, TickMultiplier, Timeframe};
 use futures::{StreamExt, stream::BoxStream, stream::select_all};
 
+use crate::{
+    config::WhitelistTemplates,
+    discovery::{self, RecoveryGuard, SharedDiscovery},
+    storage::Storage,
+};
+
 /// How many events are buffered for best-effort consumers before
 /// the slowest lagged receiver starts dropping messages.
 const BROADCAST_CAPACITY: usize = 1024;
 
 /// Capacity of the channel from exchange stream tasks to the event
-/// router.  When full, events are dropped and a warning is logged
-/// once — the server self-heals when backpressure subsides.
+/// router. A full channel applies backpressure all the way to the adapter;
+/// execution events are never discarded.
 const EVENT_CHANNEL_CAPACITY: usize = 1_000_000;
 
-/// Capacity of the channel from the event router to the batch
-/// flusher.  Together with `DataBuffer` this provides two layers
-/// of backpressure before data loss.
+/// Capacity of the channel from the event router to the batch flusher.
+/// A full channel pauses the router rather than losing persisted truth.
 const PERSIST_CHANNEL_CAPACITY: usize = 500_000;
 
 /// Aggregates all outbound channels for market-data events.
@@ -31,7 +36,7 @@ const PERSIST_CHANNEL_CAPACITY: usize = 500_000;
 /// until the final consumer.
 #[derive(Clone)]
 struct EventOutlets {
-    /// Persist channel (bounded; drops when full to prevent OOM).
+    /// Persist channel (bounded; applies backpressure when full).
     /// Single consumer — the persister in `storage.rs`.
     persist: Option<mpsc::Sender<Event>>,
     /// Best-effort fan-out to WebSocket API, alerters, etc.
@@ -58,66 +63,36 @@ impl EventOutlets {
 
     /// Handle every [`Event`] from the stream engine and route it to
     /// whichever outlets are configured.
-    async fn route(self, mut event_rx: mpsc::Receiver<Event>, shutdown: CancellationToken) {
-        let mut persist_full_warned = false;
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => {
-                    tracing::info!("Event handler cancelled");
-                    break;
+    async fn route(self, mut event_rx: mpsc::Receiver<Event>) {
+        // Do not select on cancellation here. Producers observe shutdown and
+        // drop their senders; receiving through channel closure drains every
+        // event already accepted by the bounded lossless pipeline.
+        while let Some(event) = event_rx.recv().await {
+            match &event {
+                Event::Connected(streams) => tracing::info!(?streams, "Stream connected"),
+                Event::ReplayRecovered(streams, from) => {
+                    tracing::info!(?streams, %from, "Reconnect snapshot proved stream continuity")
                 }
-                maybe = event_rx.recv() => {
-                    match maybe {
-                        Some(event) => {
-                            match &event {
-                                Event::Connected(exchange) => tracing::info!(%exchange, "Stream connected"),
-                                Event::Disconnected(exchange, reason) => tracing::warn!(%exchange, %reason, "Stream disconnected"),
-                                _ => {}
-                            }
-
-                            if let Some(ref tx) = self.broadcast
-                                && tx.receiver_count() > 0
-                            {
-                                let _ = tx.send(event.clone());
-                            }
-
-                            if let Some(ref tx) = self.persist {
-                                match tx.try_send(event) {
-                                    Ok(()) => {
-                                        if persist_full_warned {
-                                            tracing::info!(
-                                                "Persist channel recovered — no longer dropping events"
-                                            );
-                                            persist_full_warned = false;
-                                        }
-                                    }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        if !persist_full_warned {
-                                            tracing::warn!(
-                                                "Persist channel full ({} events) — \
-                                                 dropping events until backpressure subsides",
-                                                PERSIST_CHANNEL_CAPACITY,
-                                            );
-                                            persist_full_warned = true;
-                                        }
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        tracing::info!("Persist channel closed, stopping handler");
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            tracing::info!("Event channel closed, handler ending");
-                            break;
-                        }
-                    }
+                Event::Disconnected(streams, reason) => {
+                    tracing::warn!(?streams, %reason, "Stream disconnected")
                 }
+                _ => {}
+            }
+
+            if let Some(ref tx) = self.broadcast
+                && tx.receiver_count() > 0
+            {
+                let _ = tx.send(event.clone());
+            }
+
+            if let Some(ref tx) = self.persist
+                && tx.send(event).await.is_err()
+            {
+                tracing::info!("Persist channel closed, stopping handler");
+                return;
             }
         }
+        tracing::info!("Event channel drained and closed; handler ending");
     }
 }
 
@@ -146,10 +121,15 @@ impl StreamManager {
     ///
     /// Returns the manager plus a [`StreamReceivers`] containing the
     /// persist receiver.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_streams(
         handles: AdapterHandles,
         pairs: &[TickerInfo],
         shutdown: CancellationToken,
+        storage: Storage,
+        discovery: SharedDiscovery,
+        base_assets: &[String],
+        whitelist: &WhitelistTemplates,
     ) -> (Self, StreamReceivers) {
         let (persist_tx, persist_rx) = mpsc::channel(PERSIST_CHANNEL_CAPACITY);
         let (broadcast_tx, _broadcast_rx) = broadcast::channel(BROADCAST_CAPACITY);
@@ -185,6 +165,82 @@ impl StreamManager {
                 }));
             }
 
+            // A retry producer owns its event sender for its entire lifetime,
+            // including startup with zero resolved pairs. This keeps the router
+            // and flusher alive until recovery or an orderly cancellation.
+            let pending = discovery.read().pending_exchanges.clone();
+            for exchange in pending {
+                let tx = event_tx.clone();
+                let shutdown = shutdown.child_token();
+                let handles = handles.clone();
+                let storage = storage.clone();
+                let discovery = discovery.clone();
+                let base_assets = base_assets.to_vec();
+                let whitelist = whitelist.clone();
+                let recovery_guard = RecoveryGuard::new(discovery.clone(), exchange);
+                tasks.push(tokio::spawn(async move {
+                    let Some(recovered) = discovery::retry_resolve_exchange(
+                        exchange,
+                        &base_assets,
+                        &whitelist,
+                        &shutdown,
+                        discovery::INITIAL_RETRY_DELAY,
+                        discovery::MAX_RETRY_DELAY,
+                        || async {
+                            handles
+                                .fetch_ticker_metadata(exchange.venue(), &[exchange.market_type()])
+                                .await
+                                .map(|metadata| metadata.into_iter().collect())
+                                .map_err(anyhow::Error::from)
+                        },
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+
+                    // A metadata storage failure must not silently abandon the
+                    // recovered venue. Keep it pending and retry this write.
+                    loop {
+                        if shutdown.is_cancelled() {
+                            return;
+                        }
+                        let storage = storage.clone();
+                        let pairs = recovered.pairs.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            storage.store_ticker_infos(&pairs)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(())) => break,
+                            error => {
+                                tracing::error!(%exchange, ?error, "Failed to persist recovered ticker metadata; retrying");
+                                tokio::select! {
+                                    biased;
+                                    _ = shutdown.cancelled() => return,
+                                    _ = tokio::time::sleep(discovery::MAX_RETRY_DELAY) => {}
+                                }
+                            }
+                        }
+                    }
+                    if shutdown.is_cancelled() {
+                        return;
+                    }
+                    discovery.write().publish_recovered(&recovered);
+                    drop(recovery_guard);
+                    let streams = recovered
+                        .pairs
+                        .into_iter()
+                        .map(|ticker_info| StreamKind::Trades { ticker_info })
+                        .collect();
+                    if let Err(error) =
+                        run_exchange_streams(handles, exchange, streams, tx, shutdown).await
+                    {
+                        tracing::error!(%exchange, "Recovered stream engine exited: {error:#}");
+                    }
+                }));
+            }
+
             // Drop the original sender so all clones live inside the tasks.
             // When the tasks finish (on cancellation) the receiver gets None.
             drop(event_tx);
@@ -196,7 +252,7 @@ impl StreamManager {
             .with_persist(persist_tx)
             .with_broadcast(broadcast_tx);
 
-        let event_task = tokio::spawn(outlets.clone().route(event_rx, shutdown.child_token()));
+        let event_task = tokio::spawn(outlets.clone().route(event_rx));
 
         (
             Self {
@@ -208,13 +264,6 @@ impl StreamManager {
                 persist: Some(persist_rx),
             },
         )
-    }
-
-    /// Drop the persist sender so the persister's receiver
-    /// gets `None` and drains its buffers.  Call **before** joining
-    /// the persister during shutdown.
-    pub fn drop_persist_sender(&mut self) {
-        self.outlets.persist.take();
     }
 
     /// Return a new broadcast receiver for downstream consumers, or
@@ -305,8 +354,6 @@ async fn run_exchange_streams(
     }
 
     let mut merged = select_all(box_streams);
-    let mut channel_full_warned = false;
-
     loop {
         tokio::select! {
             biased;
@@ -317,31 +364,9 @@ async fn run_exchange_streams(
             event = merged.next() => {
                 match event {
                     Some(event) => {
-                        match tx.try_send(event) {
-                            Ok(()) => {
-                                if channel_full_warned {
-                                    tracing::info!(
-                                        %exchange,
-                                        "Event channel recovered — no longer dropping events"
-                                    );
-                                    channel_full_warned = false;
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                if !channel_full_warned {
-                                    tracing::warn!(
-                                        %exchange,
-                                        "Event channel full ({} events) — \
-                                         dropping events for {exchange}",
-                                        EVENT_CHANNEL_CAPACITY,
-                                    );
-                                    channel_full_warned = true;
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                tracing::info!(%exchange, "Event channel closed, stopping stream engine");
-                                break;
-                            }
+                        if tx.send(event).await.is_err() {
+                            tracing::info!(%exchange, "Event channel closed, stopping stream engine");
+                            break;
                         }
                     }
                     None => {
@@ -354,4 +379,119 @@ async fn run_exchange_streams(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::ConfigMarketKind, discovery::DiscoveryState};
+    use flowsurface_exchange::Ticker;
+    use std::{sync::Arc, time::Duration};
+
+    fn runtime() -> tokio::runtime::Runtime {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    #[test]
+    fn router_drains_accepted_events_after_producers_close() {
+        runtime().block_on(async {
+            let (event_tx, event_rx) = mpsc::channel(64);
+            let (persist_tx, mut persist_rx) = mpsc::channel(2);
+            let task = tokio::spawn(EventOutlets::new().with_persist(persist_tx).route(event_rx));
+            let pair = TickerInfo::new(
+                Ticker::new("BTC", Exchange::HyperliquidLinear),
+                0.1,
+                0.001,
+                None,
+            );
+            for _ in 0..32 {
+                event_tx
+                    .send(Event::Connected(
+                        vec![StreamKind::Trades { ticker_info: pair }].into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            drop(event_tx);
+            let mut accepted = 0;
+            while persist_rx.recv().await.is_some() {
+                accepted += 1;
+            }
+            task.await.expect("router joined");
+            assert_eq!(
+                accepted, 32,
+                "backpressured router preserves every accepted event"
+            );
+        });
+    }
+
+    #[test]
+    fn zero_resolved_pairs_keep_pipeline_alive_until_retry_cancels() {
+        let dir = std::env::temp_dir().join(format!(
+            "flowsurface-recovery-drain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        runtime().block_on(async {
+            let storage = Storage::open(&dir, 64, 1, 0).expect("test storage");
+            let whitelist: WhitelistTemplates = [(
+                "hyperliquid".into(),
+                [(ConfigMarketKind::Linear, vec!["USDC".into()])]
+                    .into_iter()
+                    .collect(),
+            )]
+            .into_iter()
+            .collect();
+            let base_assets = vec!["BTC".into()];
+            let state = Arc::new(parking_lot::RwLock::new(DiscoveryState::new(
+                &base_assets,
+                &whitelist,
+                &discovery::MetadataCache::default(),
+                Vec::new(),
+            )));
+            let shutdown = CancellationToken::new();
+            let handles = AdapterHandles::spawn_venues(&reqwest::Client::new(), [], None);
+            let (manager, mut receivers) = StreamManager::start_streams(
+                handles,
+                &[],
+                shutdown.clone(),
+                storage.clone(),
+                state.clone(),
+                &base_assets,
+                &whitelist,
+            );
+            let flusher =
+                storage.spawn_batch_flusher(&mut receivers, Duration::from_millis(10), 16);
+            tokio::task::yield_now().await;
+            assert!(
+                !flusher.is_finished(),
+                "unresolved producer keeps persistence channel open"
+            );
+            assert_eq!(
+                state.read().recovering_exchanges,
+                vec![Exchange::HyperliquidLinear]
+            );
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(2), manager.shutdown())
+                .await
+                .expect("retry cancellation joined");
+            tokio::time::timeout(Duration::from_secs(2), flusher)
+                .await
+                .expect("flusher drained")
+                .expect("flusher joined");
+            assert!(state.read().recovering_exchanges.is_empty());
+            assert_eq!(
+                state.read().pending_exchanges,
+                vec![Exchange::HyperliquidLinear]
+            );
+        });
+        std::fs::remove_dir_all(&dir).expect("remove test storage");
+    }
 }

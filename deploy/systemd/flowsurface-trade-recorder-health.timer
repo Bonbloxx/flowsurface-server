@@ -1,0 +1,12 @@
+[Unit]
+Description=Monitor FlowSurface BTC trade recorder
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
+Unit=flowsurface-trade-recorder-health.service
+
+[Install]
+WantedBy=timers.target

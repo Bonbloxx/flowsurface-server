@@ -12,6 +12,7 @@ axum-server = { version = "0.8", default-features = false, features = ["tls-rust
 hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
 tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "signal", "net", "time"] }
 futures = { version = "0.3.33", default-features = false, features = ["std", "async-await"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 parking_lot = "0.12.5"
 tower-service = "0.3.3"
@@ -22,8 +23,10 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 sha2 = "0.11"
 base64 = "0.23"
 
-# Exchange WebSocket adapters
-flowsurface-exchange = "0.8.9"
+# Exchange WebSocket adapters. Use the sibling desktop fork so the local
+# recorder and the application always run the exact same transport and trade
+# normalization code, including fixes that have not been published upstream.
+flowsurface-exchange = { path = "../flowsurface/exchange", features = ["unbounded-channel"] }
 
 # Storage
 duckdb = { version = "1.10505", features = ["bundled"] }

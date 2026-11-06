@@ -1,4 +1,8 @@
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::{future::Future, sync::Arc, time::Duration};
+
+use parking_lot::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use flowsurface_exchange::adapter::{AdapterHandles, Exchange, MarketKind, Venue};
 use flowsurface_exchange::{Ticker, TickerInfo};
@@ -6,6 +10,166 @@ use flowsurface_exchange::{Ticker, TickerInfo};
 use crate::config::WhitelistTemplates;
 
 pub type MetadataCache = FxHashMap<Exchange, FxHashMap<Ticker, Option<TickerInfo>>>;
+pub type ExchangeMetadata = FxHashMap<Ticker, Option<TickerInfo>>;
+pub type SharedDiscovery = Arc<RwLock<DiscoveryState>>;
+
+pub const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// Requested exchanges remain visible even when startup metadata cannot be fetched.
+/// The HTTP server and stream producers share this state as discovery recovers.
+pub struct DiscoveryState {
+    pub resolved_pairs: Vec<TickerInfo>,
+    pub pending_exchanges: Vec<Exchange>,
+    pub recovering_exchanges: Vec<Exchange>,
+    pub available_tickers: FxHashMap<String, Vec<String>>,
+}
+
+impl DiscoveryState {
+    pub fn new(
+        base_assets: &[String],
+        whitelist: &WhitelistTemplates,
+        cache: &MetadataCache,
+        resolved_pairs: Vec<TickerInfo>,
+    ) -> Self {
+        // Quotes are eligible alternatives, not an assertion that every generated
+        // symbol exists. Require metadata and at least one configured pair for
+        // each requested exchange, preserving the existing expansion semantics.
+        let required: FxHashSet<Exchange> = if base_assets.is_empty() {
+            FxHashSet::default()
+        } else {
+            whitelist
+                .iter()
+                .flat_map(|(venue, markets)| {
+                    let venue = venue.parse::<Venue>().ok();
+                    markets.iter().filter_map(move |(market, quotes)| {
+                        if quotes.is_empty() {
+                            return None;
+                        }
+                        Exchange::from_venue_and_market(venue?, (*market).into())
+                    })
+                })
+                .collect()
+        };
+        let pending_exchanges = Exchange::ALL
+            .into_iter()
+            .filter(|exchange| {
+                required.contains(exchange)
+                    && (!cache.contains_key(exchange)
+                        || !resolved_pairs
+                            .iter()
+                            .any(|pair| pair.exchange() == *exchange))
+            })
+            .collect();
+        Self {
+            resolved_pairs,
+            pending_exchanges,
+            recovering_exchanges: Vec::new(),
+            available_tickers: tickers_per_exchange(cache),
+        }
+    }
+
+    pub fn publish_recovered(&mut self, recovered: &ResolvedExchange) {
+        for pair in &recovered.pairs {
+            if !self
+                .resolved_pairs
+                .iter()
+                .any(|known| known.ticker == pair.ticker)
+            {
+                self.resolved_pairs.push(*pair);
+            }
+        }
+        let cache = [(recovered.exchange, recovered.metadata.clone())]
+            .into_iter()
+            .collect();
+        self.available_tickers.extend(tickers_per_exchange(&cache));
+        self.pending_exchanges
+            .retain(|exchange| *exchange != recovered.exchange);
+    }
+}
+
+/// Health must not claim that recovery is running after its producer exits or panics.
+pub struct RecoveryGuard {
+    state: SharedDiscovery,
+    exchange: Exchange,
+}
+
+impl RecoveryGuard {
+    pub fn new(state: SharedDiscovery, exchange: Exchange) -> Self {
+        let mut discovery = state.write();
+        if !discovery.recovering_exchanges.contains(&exchange) {
+            discovery.recovering_exchanges.push(exchange);
+        }
+        drop(discovery);
+        Self { state, exchange }
+    }
+}
+
+impl Drop for RecoveryGuard {
+    fn drop(&mut self) {
+        self.state
+            .write()
+            .recovering_exchanges
+            .retain(|exchange| *exchange != self.exchange);
+    }
+}
+
+pub struct ResolvedExchange {
+    pub exchange: Exchange,
+    pub metadata: ExchangeMetadata,
+    pub pairs: Vec<TickerInfo>,
+}
+
+/// Retry only a missing exchange. The fetch seam also permits deterministic
+/// transport failure tests without changing public exchange endpoints.
+pub async fn retry_resolve_exchange<F, Fut>(
+    exchange: Exchange,
+    base_assets: &[String],
+    whitelist: &WhitelistTemplates,
+    shutdown: &CancellationToken,
+    initial_delay: Duration,
+    max_delay: Duration,
+    mut fetch: F,
+) -> Option<ResolvedExchange>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<ExchangeMetadata>>,
+{
+    let mut delay = initial_delay;
+    let mut attempts = 0u64;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return None,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return None,
+            result = fetch() => result,
+        };
+        attempts = attempts.saturating_add(1);
+        match result {
+            Ok(metadata) => {
+                let cache = [(exchange, metadata)].into_iter().collect();
+                let pairs = resolve_pairs(base_assets, whitelist, &cache);
+                if !pairs.is_empty() {
+                    tracing::info!(%exchange, attempts, pairs = pairs.len(), "Missing exchange discovery recovered");
+                    return Some(ResolvedExchange {
+                        exchange,
+                        metadata: cache.into_values().next().expect("one exchange cache"),
+                        pairs,
+                    });
+                }
+                tracing::warn!(%exchange, attempts, "Metadata resolved no configured trade pairs; discovery remains pending");
+            }
+            Err(error) => {
+                tracing::warn!(%exchange, attempts, "Missing exchange metadata discovery failed: {error:#}");
+            }
+        }
+        delay = delay.saturating_mul(2).min(max_delay);
+    }
+}
 
 /// Orchestrate the full pair discovery pipeline: determine which venues to
 /// use based on discovery mode, spawn adapter handles, fetch ticker metadata
@@ -26,7 +190,12 @@ pub async fn setup_pairs(
             .collect()
     };
     tracing::info!("Spawning venue adapters: {venues:?}");
-    let adapter_handles = AdapterHandles::spawn_venues(venues, None);
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("building exchange HTTP client");
+    let adapter_handles = AdapterHandles::spawn_venues(&http_client, venues, None);
 
     tracing::info!("Fetching ticker metadata from exchanges…");
     let metadata_cache = build_metadata_cache(&adapter_handles, whitelist, discovery_mode).await;
@@ -257,4 +426,271 @@ fn resolve_pairs(
     }
 
     pairs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ConfigMarketKind;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    fn runtime() -> tokio::runtime::Runtime {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    fn whitelist() -> WhitelistTemplates {
+        [
+            (
+                "binance".into(),
+                [(ConfigMarketKind::Linear, vec!["USDT".into()])]
+                    .into_iter()
+                    .collect(),
+            ),
+            (
+                "bybit".into(),
+                [(ConfigMarketKind::Linear, vec!["USDT".into()])]
+                    .into_iter()
+                    .collect(),
+            ),
+            (
+                "hyperliquid".into(),
+                [(ConfigMarketKind::Linear, vec!["USDC".into()])]
+                    .into_iter()
+                    .collect(),
+            ),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn pair(exchange: Exchange) -> TickerInfo {
+        let symbol = if exchange == Exchange::HyperliquidLinear {
+            "BTC"
+        } else {
+            "BTCUSDT"
+        };
+        TickerInfo::new(Ticker::new(symbol, exchange), 0.1, 0.001, None)
+    }
+
+    fn metadata(exchange: Exchange) -> ExchangeMetadata {
+        let info = pair(exchange);
+        [(info.ticker, Some(info))].into_iter().collect()
+    }
+
+    fn missing_hyperliquid_state() -> SharedDiscovery {
+        let pairs = vec![pair(Exchange::BinanceLinear), pair(Exchange::BybitLinear)];
+        let cache = [
+            (Exchange::BinanceLinear, metadata(Exchange::BinanceLinear)),
+            (Exchange::BybitLinear, metadata(Exchange::BybitLinear)),
+        ]
+        .into_iter()
+        .collect();
+        Arc::new(RwLock::new(DiscoveryState::new(
+            &["BTC".into()],
+            &whitelist(),
+            &cache,
+            pairs,
+        )))
+    }
+
+    #[test]
+    fn only_missing_exchange_is_pending_and_dead_recovery_is_visible() {
+        let state = missing_hyperliquid_state();
+        assert_eq!(
+            state.read().pending_exchanges,
+            vec![Exchange::HyperliquidLinear]
+        );
+        assert!(state.read().recovering_exchanges.is_empty());
+        let guard = RecoveryGuard::new(state.clone(), Exchange::HyperliquidLinear);
+        assert_eq!(
+            state.read().recovering_exchanges,
+            vec![Exchange::HyperliquidLinear]
+        );
+        drop(guard);
+        assert!(state.read().recovering_exchanges.is_empty());
+        assert_eq!(
+            state.read().pending_exchanges,
+            vec![Exchange::HyperliquidLinear]
+        );
+    }
+
+    #[test]
+    fn successful_but_empty_metadata_remains_pending() {
+        let cache = [(Exchange::HyperliquidLinear, ExchangeMetadata::default())]
+            .into_iter()
+            .collect();
+        let state = DiscoveryState::new(&["BTC".into()], &whitelist(), &cache, Vec::new());
+        assert!(
+            state
+                .pending_exchanges
+                .contains(&Exchange::HyperliquidLinear)
+        );
+    }
+
+    #[test]
+    fn metadata_http_502_recovers_without_refetching_healthy_venues() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fault HTTP listener");
+        let url = format!("http://{}/metadata", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let http = std::thread::spawn(move || {
+            for status in ["502 Bad Gateway", "200 OK"] {
+                let (mut socket, _) = listener.accept().expect("fault HTTP connection");
+                let mut request = [0; 1024];
+                let received = socket.read(&mut request).expect("HTTP request");
+                assert!(received > 0, "HTTP request was empty");
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let body = if status.starts_with("200") {
+                    r#"{"symbol":"BTC"}"#
+                } else {
+                    "bad gateway"
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("fault HTTP response");
+            }
+        });
+        runtime().block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let state = missing_hyperliquid_state();
+            let healthy = state.read().resolved_pairs.clone();
+            let guard = RecoveryGuard::new(state.clone(), Exchange::HyperliquidLinear);
+            let recovered = tokio::time::timeout(
+                Duration::from_secs(5),
+                retry_resolve_exchange(
+                    Exchange::HyperliquidLinear,
+                    &["BTC".into()],
+                    &whitelist(),
+                    &CancellationToken::new(),
+                    Duration::from_millis(1),
+                    Duration::from_millis(4),
+                    || async {
+                        let body = client
+                            .get(&url)
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .text()
+                            .await?;
+                        let value: serde_json::Value = serde_json::from_str(&body)?;
+                        let info = TickerInfo::new(
+                            Ticker::new(
+                                value["symbol"].as_str().expect("symbol"),
+                                Exchange::HyperliquidLinear,
+                            ),
+                            0.1,
+                            0.001,
+                            None,
+                        );
+                        Ok([(info.ticker, Some(info))].into_iter().collect())
+                    },
+                ),
+            )
+            .await
+            .expect("recovery bounded")
+            .expect("recovered exchange");
+            assert_eq!(recovered.pairs, vec![pair(Exchange::HyperliquidLinear)]);
+            let mut discovery = state.write();
+            discovery.publish_recovered(&recovered);
+            discovery.publish_recovered(&recovered);
+            assert_eq!(discovery.resolved_pairs.len(), 3, "recovery is idempotent");
+            assert_eq!(&discovery.resolved_pairs[..2], healthy.as_slice());
+            assert!(discovery.pending_exchanges.is_empty());
+            assert_eq!(
+                discovery.available_tickers[&Exchange::HyperliquidLinear.to_string()],
+                vec!["BTC"]
+            );
+            drop(discovery);
+            drop(guard);
+            assert!(state.read().recovering_exchanges.is_empty());
+        });
+        http.join().expect("fault HTTP server finished");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn unresolved_success_is_retried_until_cancelled() {
+        runtime().block_on(async {
+            let shutdown = CancellationToken::new();
+            let mut calls = 0;
+            let result = retry_resolve_exchange(
+                Exchange::HyperliquidLinear,
+                &["BTC".into()],
+                &whitelist(),
+                &shutdown,
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                || {
+                    calls += 1;
+                    if calls == 3 {
+                        shutdown.cancel();
+                    }
+                    std::future::ready(Ok(ExchangeMetadata::default()))
+                },
+            )
+            .await;
+            assert!(result.is_none());
+            assert_eq!(calls, 3);
+        });
+    }
+
+    #[test]
+    fn cancellation_interrupts_fetch_and_backoff() {
+        runtime().block_on(async {
+            for during_fetch in [false, true] {
+                let shutdown = CancellationToken::new();
+                let worker_shutdown = shutdown.clone();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(async move {
+                    let mut started_tx = Some(started_tx);
+                    retry_resolve_exchange(
+                        Exchange::HyperliquidLinear,
+                        &["BTC".into()],
+                        &whitelist(),
+                        &worker_shutdown,
+                        if during_fetch {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_secs(30)
+                        },
+                        Duration::from_secs(30),
+                        || {
+                            if let Some(tx) = started_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            std::future::pending::<anyhow::Result<ExchangeMetadata>>()
+                        },
+                    )
+                    .await
+                });
+                if during_fetch {
+                    started_rx.await.expect("fetch started");
+                } else {
+                    tokio::task::yield_now().await;
+                }
+                shutdown.cancel();
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), task)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        });
+    }
 }
